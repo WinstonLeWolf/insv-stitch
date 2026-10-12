@@ -750,13 +750,26 @@ class FlowEngine:
 # ============================================================
 
 def find_seam_dp(img_a, img_b):
-    """Optimal vertical seam via dynamic programming."""
+    """Optimal vertical seam via dynamic programming with structural edge-awareness."""
     h, w = img_a.shape[:2]
     diff = np.linalg.norm(
         img_a.astype(np.float32) - img_b.astype(np.float32), axis=2)
-    ga = cv2.Sobel(cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY), cv2.CV_32F, 1, 0)
-    gb = cv2.Sobel(cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY), cv2.CV_32F, 1, 0)
-    cost = diff + 0.5 * np.abs(ga - gb)
+    
+    # Compute horizontal and vertical gradients for structural edge awareness
+    gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
+    gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
+    ga_x = cv2.Sobel(gray_a, cv2.CV_32F, 1, 0)
+    ga_y = cv2.Sobel(gray_a, cv2.CV_32F, 0, 1)
+    gb_x = cv2.Sobel(gray_b, cv2.CV_32F, 1, 0)
+    gb_y = cv2.Sobel(gray_b, cv2.CV_32F, 0, 1)
+    
+    grad_mag_a = np.sqrt(ga_x**2 + ga_y**2)
+    grad_mag_b = np.sqrt(gb_x**2 + gb_y**2)
+    grad_sum = grad_mag_a + grad_mag_b
+    
+    # Penalize large color differences while dividing by gradient intensity
+    # to encourage cutting through flat/low-texture regions instead of salient edges:
+    cost = (diff**2) / (grad_sum + 10.0) + 0.1 * np.abs(grad_mag_a - grad_mag_b)
 
     dp = cost.copy()
     for row in range(1, h):
@@ -800,10 +813,26 @@ def _laplacian_pyramid(img, levels):
 
 
 def multiband_blend(img_a, img_b, seam_mask, levels=5, feather_px=10):
-    """Laplacian pyramid multi-band blending."""
-    a = img_a.astype(np.float64)
-    b = img_b.astype(np.float64)
-    mask = seam_mask.astype(np.float64) / 255.0
+    """Laplacian pyramid multi-band blending with safe power-of-two padding."""
+    h_orig, w_orig = img_a.shape[:2]
+    
+    # Pad to multiple of 2^(levels-1) to avoid pyrDown / pyrUp shape mismatch
+    align = 1 << (levels - 1)
+    pad_h = (align - (h_orig % align)) % align
+    pad_w = (align - (w_orig % align)) % align
+    
+    if pad_h > 0 or pad_w > 0:
+        a = cv2.copyMakeBorder(img_a, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+        b = cv2.copyMakeBorder(img_b, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+        m = cv2.copyMakeBorder(seam_mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+    else:
+        a = img_a.copy()
+        b = img_b.copy()
+        m = seam_mask.copy()
+        
+    a = a.astype(np.float64)
+    b = b.astype(np.float64)
+    mask = m.astype(np.float64) / 255.0
     if feather_px > 0:
         mask = cv2.GaussianBlur(mask, (0, 0), feather_px)
     if mask.ndim == 2:
@@ -820,7 +849,8 @@ def multiband_blend(img_a, img_b, seam_mask, levels=5, feather_px=10):
         h, w = blended[i].shape[:2]
         result = cv2.pyrUp(result, dstsize=(w, h)) + blended[i]
 
-    return np.clip(result, 0, 255).astype(np.uint8)
+    cropped = np.clip(result[:h_orig, :w_orig], 0, 255).astype(np.uint8)
+    return cropped
 
 
 # ============================================================
@@ -1021,17 +1051,25 @@ class X5Pipeline:
             0, 255).astype(np.uint8)
 
         if self.enable_flow:
-            # Apply flow + seam only in the stitch-line regions (~±90° lon).
-            # Two stitch bands: one on the left side (~270° = col near 3/4),
-            # one on the right side (~90° = col near 1/4).
-            stitch_half_width_deg = 15.0
+            # Dynamically identify overlap bands from lens masks rather than hardcoded 90/270 longitudes
+            overlap_mask_all, detected_bands = find_overlap_bands(valid_f, valid_b)
             stitch_bands = []
-            for stitch_lon_deg in [90.0, 270.0]:
-                col_center = int(stitch_lon_deg / 360.0 * self.eq_w)
-                hw = int(stitch_half_width_deg / 360.0 * self.eq_w)
-                col_s = max(0, col_center - hw)
-                col_e = min(self.eq_w, col_center + hw)
-                stitch_bands.append((col_s, col_e))
+            stitch_half_width_deg = 15.0
+            pad_w = int(stitch_half_width_deg / 360.0 * self.eq_w)
+
+            if detected_bands:
+                for bs, be in detected_bands:
+                    col_c = (bs + be) // 2
+                    col_s = max(0, col_c - pad_w)
+                    col_e = min(self.eq_w, col_c + pad_w)
+                    if col_e - col_s >= 10:
+                        stitch_bands.append((col_s, col_e))
+            else:
+                for stitch_lon_deg in [90.0, 270.0]:
+                    col_center = int(stitch_lon_deg / 360.0 * self.eq_w)
+                    col_s = max(0, col_center - pad_w)
+                    col_e = min(self.eq_w, col_center + pad_w)
+                    stitch_bands.append((col_s, col_e))
 
             for col_s, col_e in stitch_bands:
                 band_w = col_e - col_s
@@ -1090,31 +1128,35 @@ class X5Pipeline:
                 # Zero flow outside the overlap (no correction needed there)
                 flow[~band_overlap] = 0
 
-                # Partial flow warp: each image moves halfway toward
-                # the other to reduce parallax in the overlap.
-                h, w = flow.shape[:2]
+                # Parallax half-way warp based on coverage weights:
+                # flow maps fg (front) -> bg (back).
+                # Backward mapping coordinates:
                 ys, xs = np.mgrid[:h, :w].astype(np.float32)
+                wf_sub = self.w_front[:, s:e]
+                wb_sub = self.w_back[:, s:e]
+                sum_w = wf_sub + wb_sub
+                alpha_warp = np.where(sum_w > 1e-4, wb_sub / sum_w, 0.5).astype(np.float32)
 
-                alpha = np.linspace(0, 1, w, dtype=np.float32).reshape(1, -1)
-                alpha = np.broadcast_to(alpha, (h, w))
-
-                fw = cv2.remap(fc, xs + alpha * flow[:, :, 0] * 0.5,
-                               ys + alpha * flow[:, :, 1] * 0.5,
+                fw = cv2.remap(fc, xs - alpha_warp * flow[:, :, 0] * 0.5,
+                               ys - alpha_warp * flow[:, :, 1] * 0.5,
                                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-                bw_img = cv2.remap(bc, xs - (1 - alpha) * flow[:, :, 0] * 0.5,
-                                   ys - (1 - alpha) * flow[:, :, 1] * 0.5,
+                bw_img = cv2.remap(bc, xs + (1.0 - alpha_warp) * flow[:, :, 0] * 0.5,
+                                   ys + (1.0 - alpha_warp) * flow[:, :, 1] * 0.5,
                                    cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-                # Seam finding + multi-band blending
+                # Edge-avoiding seam finding + multi-band blending
                 seam = find_seam_dp(fw, bw_img)
                 blended = multiband_blend(fw, bw_img, seam,
-                                          levels=5, feather_px=25)
+                                          levels=5, feather_px=15)
 
-                # Only write where both lenses are valid
-                blend_mask = band_overlap[:, :, np.newaxis].astype(np.float32)
+                # Smoothly feather transition into the base canvas to eliminate border seams
+                dist_overlap = cv2.distanceTransform(band_overlap.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+                feather_radius = max(5.0, band_w * 0.15)
+                taper = np.clip(dist_overlap / feather_radius, 0.0, 1.0)[:, :, np.newaxis]
+
                 orig = result[:, s:e].astype(np.float32)
                 result[:, s:e] = np.clip(
-                    blended * blend_mask + orig * (1 - blend_mask),
+                    blended.astype(np.float32) * taper + orig * (1.0 - taper),
                     0, 255).astype(np.uint8)
         else:
             # Simple weighted blend (no flow)
