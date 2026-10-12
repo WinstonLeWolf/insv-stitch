@@ -17,7 +17,10 @@ from pathlib import Path
 from scipy.spatial.transform import Rotation, Slerp
 from scipy.ndimage import uniform_filter1d
 
-import telemetry_parser
+try:
+    import telemetry_parser
+except ImportError:
+    telemetry_parser = None
 
 
 # ============================================================
@@ -80,54 +83,87 @@ class PipelineMetadata:
 # 2. Metadata Extraction
 # ============================================================
 
-def _find_pb_path(insv_path: str) -> str | None:
-    """Find the .pb protobuf sidecar file for an .insv file."""
-    insv = Path(insv_path)
-    # Look in MISC/Camera01/ relative to the DCIM/Camera01/ path
-    misc_dir = insv.parent.parent.parent / 'MISC' / 'Camera01'
-    pb_name = insv.name + '.pb'
+def _find_pb_path(input_path: str, explicit_pb: str | None = None) -> str | None:
+    """Find the .pb protobuf sidecar file for an .insv or .insp file."""
+    if explicit_pb and Path(explicit_pb).exists():
+        return str(explicit_pb)
+
+    p = Path(input_path)
+    # 1. Look in MISC/Camera01/ relative to the DCIM/Camera01/ path
+    misc_dir = p.parent.parent.parent / 'MISC' / 'Camera01'
+    pb_name = p.name + '.pb'
     pb_path = misc_dir / pb_name
     if pb_path.exists():
         return str(pb_path)
+
+    # If exact name is not found (e.g. IMG_xxx.insp), check for any .pb in MISC/Camera01/
+    if misc_dir.exists():
+        pb_candidates = list(misc_dir.glob('*.pb'))
+        if pb_candidates:
+            return str(pb_candidates[0])
+
+    # 2. Check in same folder as input
+    same_dir_pb = p.parent / (p.name + '.pb')
+    if same_dir_pb.exists():
+        return str(same_dir_pb)
+    same_dir_candidates = list(p.parent.glob('*.pb'))
+    if same_dir_candidates:
+        return str(same_dir_candidates[0])
+
     return None
 
 
-def _parse_extended_calibration(pb_path: str) -> list[float] | None:
+def _parse_extended_calibration(file_path: str) -> list[float] | None:
     """
-    Extract the extended 56-element calibration string from a .pb file.
+    Extract the extended 56-element calibration string from a .pb or .insp file.
     Returns the parsed float values, or None if not found.
     """
-    with open(pb_path, 'rb') as f:
-        data = f.read()
-
-    text = data.decode('latin-1')
-
-    # Find base64-encoded content
-    b64_match = re.search(r'[A-Za-z0-9+/=]{100,}', text)
-    if not b64_match:
+    if not file_path or not Path(file_path).exists():
+        return None
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+    except Exception:
         return None
 
-    decoded = base64.b64decode(b64_match.group()).decode('latin-1')
+    text = data.decode('latin-1', errors='ignore')
 
-    # Find calibration strings: "2_<numbers...>" with >40 elements
-    for match in re.finditer(r'2_[\d]+\.[\d]+_', decoded):
+    # 1. Find direct calibration strings: "2_<numbers...>" with >40 elements
+    for match in re.finditer(r'2_[\d]+\.[\d]+_', text):
         start = match.start()
-        # Extract the full numeric string
-        chunk = decoded[start:]
+        chunk = text[start:]
         parts = []
         for token in chunk.split('_'):
             try:
                 parts.append(float(token))
             except ValueError:
                 break
-        if len(parts) >= 55:  # Extended format has 56 elements
+        if len(parts) >= 55:
             return parts
+
+    # 2. Find base64-encoded content
+    for b64_match in re.finditer(r'[A-Za-z0-9+/=]{100,}', text):
+        try:
+            decoded = base64.b64decode(b64_match.group()).decode('latin-1', errors='ignore')
+            for match in re.finditer(r'2_[\d]+\.[\d]+_', decoded):
+                start = match.start()
+                chunk = decoded[start:]
+                parts = []
+                for token in chunk.split('_'):
+                    try:
+                        parts.append(float(token))
+                    except ValueError:
+                        break
+                if len(parts) >= 55:
+                    return parts
+        except Exception:
+            continue
 
     return None
 
 
 def _sensor_to_video(fx, fy, cx, cy, sensor_w=5376, video_w=3840, cx_fix=2.0):
-    """Convert calibration values from sensor resolution to video resolution."""
+    """Convert calibration values from sensor resolution to video or photo resolution."""
     crop_info_dst = 5312  # window_crop_info dst_width
     scale = video_w / crop_info_dst
     # cx_fix=2 for X5: cx is halved in Gyroflow convention, we double it
@@ -138,34 +174,78 @@ def _sensor_to_video(fx, fy, cx, cy, sensor_w=5376, video_w=3840, cx_fix=2.0):
     return fx_v, fy_v, cx_v, cy_v
 
 
-def extract_metadata(insv_path: str) -> PipelineMetadata:
+def extract_metadata(input_path: str, pb_path: str | None = None) -> PipelineMetadata:
     """
-    Extract all metadata from .insv file.
+    Extract all metadata from .insv or .insp file.
     Prefers extended protobuf calibration (13-coeff model) if available,
     falls back to offset_v3 / Gyroflow profile.
     """
-    tp = telemetry_parser.Parser(insv_path)
-    telem = tp.telemetry()
-    item = telem[0]
+    p = Path(input_path)
+    is_photo = p.suffix.lower() in ('.insp', '.jpg', '.jpeg')
 
-    meta = item['Default']['Metadata']
-    lens_data = item['Lens']['Data']
-    dim = meta['dimension']
-    width, height = dim['x'], dim['y']
-    offset = meta['offset']
+    meta = {}
+    lens_data = {}
+    offset = None
+    imu_samples = []
 
-    # Try to load extended calibration from protobuf sidecar
-    pb_path = _find_pb_path(insv_path)
-    ext = _parse_extended_calibration(pb_path) if pb_path else None
+    if is_photo:
+        img = cv2.imread(input_path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError(f"Cannot read photo file: {input_path}")
+        h, full_w = img.shape[:2]
+        width, height = full_w // 2, h
+        fps_val = 1.0
+        frame_count = 1
+        frame_readout_time = 0.0
+
+        # Try extracting telemetry/offset from photo if available
+        try:
+            tp = telemetry_parser.Parser(input_path)
+            telem = tp.telemetry()
+            if telem:
+                item = telem[0]
+                meta = item.get('Default', {}).get('Metadata', {})
+                lens_data = item.get('Lens', {}).get('Data', {})
+                offset = meta.get('offset', None)
+                imu_samples = tp.normalized_imu()
+        except Exception:
+            pass
+    else:
+        if telemetry_parser is None:
+            raise ImportError(
+                "telemetry-parser is required to extract IMU and video telemetry from .insv files. "
+                "Install it with: pip install telemetry-parser"
+            )
+        tp = telemetry_parser.Parser(input_path)
+        telem = tp.telemetry()
+        item = telem[0]
+        meta = item.get('Default', {}).get('Metadata', {})
+        lens_data = item.get('Lens', {}).get('Data', {})
+        dim = meta.get('dimension', {})
+        width, height = dim.get('x', 3840), dim.get('y', 3840)
+        offset = meta.get('offset', None)
+        imu_samples = tp.normalized_imu()
+        fps_val = float(meta.get('frame_rate', 30))
+        frame_readout_time = lens_data.get('frame_readout_time', 21.24)
+
+        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+               '-show_entries', 'stream=nb_frames', '-of', 'csv=p=0', input_path]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            frame_count = int(r.stdout.strip())
+        except Exception:
+            frame_count = 0
+
+    # Try to load extended calibration:
+    # 1. From sidecar .pb file
+    detected_pb = _find_pb_path(input_path, pb_path)
+    ext = _parse_extended_calibration(detected_pb) if detected_pb else None
+    # 2. From input file itself (embedded trailer in .insp or .insv)
+    if not ext:
+        ext = _parse_extended_calibration(input_path)
 
     if ext and len(ext) >= 55:
         # ---- Extended 56-element calibration (best available) ----
-        # Format: [0]=num, per lens (27 elements):
-        #   [+0]=xi, [+1]=fx, [+2]=fy, [+3]=cx, [+4]=cy,
-        #   [+5]=yaw, [+6]=pitch, [+7]=roll,
-        #   [+8]=tx, [+9]=ty, [+10]=tz,
-        #   [+11..+23]=13 distortion coefficients,
-        #   [+24]=w, [+25]=h, [+26]=type
         lenses = []
         for lens_idx in range(2):
             s = 1 + lens_idx * 27
@@ -176,10 +256,10 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
             tx, ty, tz = ext[s+8], ext[s+9], ext[s+10]
             coeffs = ext[s+11:s+24]
 
-            # Convert to video resolution
+            # Convert to video or photo resolution
             if lens_idx == 1:
                 cx_s -= 5376  # Remove concatenated offset
-            fx_v, fy_v, cx_v, cy_v = _sensor_to_video(fx_s, fy_s, cx_s, cy_s)
+            fx_v, fy_v, cx_v, cy_v = _sensor_to_video(fx_s, fy_s, cx_s, cy_s, sensor_w=5376, video_w=width)
 
             # Extrinsic rotation (small yaw/pitch corrections only)
             if lens_idx == 0:
@@ -200,7 +280,7 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
             lenses.append(lens)
 
         print(f"  Using extended protobuf calibration (13 coefficients per lens)")
-    else:
+    elif offset and lens_data.get('fisheye_params'):
         # ---- Fallback: Gyroflow / offset_v3 (5-coeff model) ----
         fp = lens_data['fisheye_params']
         dc = fp['distortion_coeffs']
@@ -236,25 +316,32 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
         )
         lenses = [lens_front, lens_back]
         print(f"  Using Gyroflow/offset_v3 calibration (5 coefficients)")
-
-    imu_samples = tp.normalized_imu()
-    fps_val = float(meta.get('frame_rate', 30))
-    frame_readout_time = lens_data.get('frame_readout_time', 21.24)
-
-    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-           '-show_entries', 'stream=nb_frames', '-of', 'csv=p=0', insv_path]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        frame_count = int(r.stdout.strip())
-    except Exception:
-        frame_count = 0
+    else:
+        # Default nominal X5 MEI calibration if no sidecar .pb or metadata available
+        scale = width / 3840.0
+        fx_nom = 3087.0 * scale
+        fy_nom = 3087.0 * scale
+        cx_nom = (width / 2.0)
+        cy_nom = (height / 2.0)
+        R0 = np.eye(3)
+        R1 = Rotation.from_euler('Y', 180, degrees=True).as_matrix()
+        lens_front = MEILensParams(
+            xi=2.0, fx=fx_nom, fy=fy_nom, cx=cx_nom, cy=cy_nom,
+            R_extrinsic=R0, width=width, height=height
+        )
+        lens_back = MEILensParams(
+            xi=2.0, fx=fx_nom, fy=fy_nom, cx=cx_nom, cy=cy_nom,
+            R_extrinsic=R1, width=width, height=height
+        )
+        lenses = [lens_front, lens_back]
+        print(f"  Notice: No sidecar .pb found. Using default nominal MEI lens profile (pass --pb to specify custom calibration)")
 
     return PipelineMetadata(
         lens_params=lenses,
         imu_samples=imu_samples, fps=fps_val,
         frame_count=frame_count,
         frame_readout_time=frame_readout_time,
-        width=width, height=height, offset=offset,
+        width=width, height=height, offset=offset if offset else [],
     )
 
 
@@ -434,11 +521,24 @@ def compute_rs_rotations(imu_samples, frame_num, fps, readout_time_ms,
 # 4. Frame Decoding
 # ============================================================
 
-def decode_frame(insv_path, frame_num, track, width, height):
-    """Decode a single frame from a specific video track."""
+def decode_frame(input_path, frame_num, track, width, height):
+    """Decode a single frame from video track or extract from dual-fisheye photo."""
+    ext = Path(input_path).suffix.lower()
+    if ext in ('.insp', '.jpg', '.jpeg'):
+        img = cv2.imread(input_path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError(f"Cannot read image file: {input_path}")
+        h, w = img.shape[:2]
+        half_w = w // 2
+        # Dual-fisheye photo: left half = back lens (track 1), right half = front lens (track 0)
+        if track == 0:
+            return img[:, half_w:].copy()
+        else:
+            return img[:, :half_w].copy()
+
     cmd = [
         'ffmpeg', '-y', '-loglevel', 'error',
-        '-i', insv_path, '-map', f'0:{track}',
+        '-i', input_path, '-map', f'0:{track}',
         '-vf', f'select=eq(n\\,{frame_num})',
         '-frames:v', '1',
         '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'
@@ -873,27 +973,34 @@ def find_overlap_bands(valid_front, valid_back):
 
 class X5Pipeline:
 
-    def __init__(self, insv_path, eq_width=3840,
+    def __init__(self, input_path, eq_width=3840,
                  enable_stabilization=True, enable_flow=True,
-                 denoise=False):
-        self.insv_path = insv_path
+                 denoise=False, pb_path=None):
+        self.input_path = input_path
+        self.insv_path = input_path  # backward compatibility
+        self.is_photo = Path(input_path).suffix.lower() in ('.insp', '.jpg', '.jpeg')
         self.eq_w = eq_width
         self.eq_h = eq_width // 2
         self.enable_flow = enable_flow
         self.denoise = denoise
 
         print("[1/4] Extracting metadata...")
-        self.meta = extract_metadata(insv_path)
-        print(f"  Video: {self.meta.width}x{self.meta.height} @ "
-              f"{self.meta.fps}fps, {self.meta.frame_count} frames")
+        self.meta = extract_metadata(input_path, pb_path=pb_path)
+        if self.is_photo:
+            print(f"  Photo: {self.meta.width*2}x{self.meta.height} dual-fisheye")
+        else:
+            print(f"  Video: {self.meta.width}x{self.meta.height} @ "
+                  f"{self.meta.fps}fps, {self.meta.frame_count} frames")
 
         print("[2/4] Computing IMU stabilization...")
-        if enable_stabilization:
+        if enable_stabilization and not self.is_photo and self.meta.imu_samples:
             self.stab_corrections = compute_stabilization_from_imu(
                 self.meta.imu_samples, self.meta.fps)
             print(f"  {len(self.stab_corrections)} frame corrections computed")
         else:
             self.stab_corrections = {}
+            if self.is_photo:
+                print("  Still photo input: using static level orientation")
 
         print("[3/4] Building remap tables...")
         self._build_maps(frame_idx=0)
@@ -908,10 +1015,13 @@ class X5Pipeline:
         """Build remap tables with stabilization + rolling shutter correction."""
         R_stab = self.stab_corrections.get(frame_idx, Rotation.identity())
 
-        # Per-scanline RS correction from gyro data
-        rs_rots = compute_rs_rotations(
-            self.meta.imu_samples, frame_idx, self.meta.fps,
-            self.meta.frame_readout_time, n_scanlines=32)
+        # Per-scanline RS correction from gyro data (videos only)
+        if self.is_photo or not self.meta.imu_samples:
+            rs_rots = None
+        else:
+            rs_rots = compute_rs_rotations(
+                self.meta.imu_samples, frame_idx, self.meta.fps,
+                self.meta.frame_readout_time, n_scanlines=32)
 
         self.maps = []
         for lens in self.meta.lens_params:
@@ -1006,9 +1116,9 @@ class X5Pipeline:
         if self.stab_corrections:
             self._build_maps(frame_num)
 
-        front = decode_frame(self.insv_path, frame_num, 0,
+        front = decode_frame(self.input_path, frame_num, 0,
                              self.meta.width, self.meta.height)
-        back = decode_frame(self.insv_path, frame_num, 1,
+        back = decode_frame(self.input_path, frame_num, 1,
                             self.meta.width, self.meta.height)
 
         eq_front = remap_fisheye(front, *self.maps[0])
@@ -1247,10 +1357,15 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='Insta360 X5 Stitching Pipeline')
-    parser.add_argument('input', help='Path to .insv file')
-    parser.add_argument('-o', '--output', default='output.jpg')
-    parser.add_argument('-f', '--frame', type=int, default=0)
-    parser.add_argument('-w', '--width', type=int, default=3840)
+    parser.add_argument('input', help='Path to .insv video or .insp photo file')
+    parser.add_argument('-o', '--output', default='output.jpg',
+                        help='Output file path (.jpg or .mp4)')
+    parser.add_argument('-f', '--frame', type=int, default=0,
+                        help='Frame index to stitch (video only)')
+    parser.add_argument('-w', '--width', type=int, default=3840,
+                        help='Equirectangular output width')
+    parser.add_argument('--pb', default=None,
+                        help='Explicit path to .pb calibration file')
     parser.add_argument('--no-stab', action='store_true',
                         help='Disable IMU stabilization')
     parser.add_argument('--no-flow', action='store_true',
@@ -1258,24 +1373,29 @@ if __name__ == '__main__':
     parser.add_argument('--denoise', action='store_true',
                         help='Apply bilateral denoising (matches Insta360 Studio)')
     parser.add_argument('--video', action='store_true',
-                        help='Process all frames to video')
+                        help='Process all frames to video (for .insv files)')
     parser.add_argument('--start', type=int, default=0,
                         help='Start frame (for video mode)')
     parser.add_argument('--end', type=int, default=-1,
                         help='End frame (for video mode, -1 = all)')
-    parser.add_argument('--gt', help='Ground truth video for comparison')
+    parser.add_argument('--gt', help='Ground truth video or image for comparison')
     args = parser.parse_args()
 
     pipeline = X5Pipeline(args.input, eq_width=args.width,
                           enable_stabilization=not args.no_stab,
                           enable_flow=not args.no_flow,
-                          denoise=args.denoise)
+                          denoise=args.denoise,
+                          pb_path=args.pb)
 
     if args.video:
-        pipeline.stitch_video(args.output, args.start, args.end)
+        if pipeline.is_photo:
+            print("Error: --video was specified, but input is a still photo (.insp). Stitching as single image instead.")
+            result = pipeline.stitch_frame_to_file(0, args.output)
+        else:
+            pipeline.stitch_video(args.output, args.start, args.end)
     else:
-        result = pipeline.stitch_frame_to_file(args.frame, args.output)
+        result = pipeline.stitch_frame_to_file(args.frame if not pipeline.is_photo else 0, args.output)
         if args.gt:
-            gt = extract_gt_frame(args.gt, args.frame)
+            gt = extract_gt_frame(args.gt, args.frame if not pipeline.is_photo else 0)
             psnr = compare_psnr(result, gt)
             print(f"PSNR vs ground truth: {psnr:.2f} dB")
